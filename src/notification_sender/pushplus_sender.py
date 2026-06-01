@@ -86,12 +86,25 @@ class PushplusSender:
             logger.error(f"发送 PushPlus 消息失败: {e}")
             return False
 
+    def _markdown_to_html(self, md: str) -> str:
+        """Convert Markdown to HTML for reliable PushPlus rendering."""
+        try:
+            import markdown2
+            return markdown2.markdown(
+                md,
+                extras=["tables", "fenced-code-blocks", "strike", "break-on-newline"],
+            )
+        except Exception:
+            return md
+
     def _send_pushplus_message(self, api_url: str, content: str, title: str) -> bool:
+        html_content = self._markdown_to_html(content)
+        template = "html" if html_content != content else "markdown"
         payload = {
             "token": self._pushplus_token,
             "title": title,
-            "content": content,
-            "template": "markdown",
+            "content": html_content,
+            "template": template,
         }
 
         if self._pushplus_topic:

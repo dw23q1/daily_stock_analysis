@@ -655,7 +655,7 @@ def main() -> int:
                     news_max_age_days=config.news_max_age_days,
                 )
 
-            if config.gemini_api_key or config.openai_api_key:
+            if config.gemini_api_key or config.openai_api_key or config.deepseek_api_keys:
                 analyzer = GeminiAnalyzer(api_key=config.gemini_api_key)
                 if not analyzer.is_available():
                     logger.warning("AI 分析器不可用，将使用模板报告")
