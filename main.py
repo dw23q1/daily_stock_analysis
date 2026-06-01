@@ -681,9 +681,10 @@ def main() -> int:
             # 发送通知（如果配置了且未禁用）
             if not args.no_notify and dragon_report.ai_report:
                 try:
-                    notifier.send_text(
-                        title=f"A股监链报告 {dragon_report.date} {dragon_report.scan_time}",
-                        content=dragon_report.ai_report,
+                    title = f"## A股监链报告 {dragon_report.date} {dragon_report.scan_time}\n\n"
+                    notifier.send(
+                        content=title + dragon_report.ai_report,
+                        email_send_to_all=True,
                     )
                     logger.info("[监链] 报告已发送通知")
                 except Exception as e:
