@@ -67,21 +67,27 @@ class PushplusSender:
             title = f"📈 股票分析报告 - {date_str}"
 
         try:
-            content_bytes = len(content.encode('utf-8'))
-            if content_bytes > self._pushplus_max_bytes:
+            # Convert Markdown→HTML once, then size-check the HTML (not raw Markdown).
+            # HTML is 2-3x larger than Markdown, so checking Markdown size would
+            # skip chunking even when the delivered payload exceeds the limit.
+            html_content = self._markdown_to_html(content)
+            template = "html" if html_content != content else "markdown"
+
+            html_bytes = len(html_content.encode('utf-8'))
+            if html_bytes > self._pushplus_max_bytes:
                 logger.info(
-                    "PushPlus 消息内容超长(%s字节/%s字符)，将分批发送",
-                    content_bytes,
-                    len(content),
+                    "PushPlus HTML 内容超长(%s字节)，将分批发送",
+                    html_bytes,
                 )
-                return self._send_pushplus_chunked(
+                return self._send_pushplus_chunked_html(
                     api_url,
-                    content,
+                    html_content,
                     title,
+                    template,
                     self._pushplus_max_bytes,
                 )
 
-            return self._send_pushplus_message(api_url, content, title)
+            return self._send_pushplus_payload(api_url, html_content, title, template)
         except Exception as e:
             logger.error(f"发送 PushPlus 消息失败: {e}")
             return False
@@ -98,12 +104,16 @@ class PushplusSender:
             return md
 
     def _send_pushplus_message(self, api_url: str, content: str, title: str) -> bool:
+        """Legacy entry point kept for _send_pushplus_chunked compatibility."""
         html_content = self._markdown_to_html(content)
         template = "html" if html_content != content else "markdown"
+        return self._send_pushplus_payload(api_url, html_content, title, template)
+
+    def _send_pushplus_payload(self, api_url: str, content: str, title: str, template: str) -> bool:
         payload = {
             "token": self._pushplus_token,
             "title": title,
-            "content": html_content,
+            "content": content,
             "template": template,
         }
 
@@ -126,9 +136,17 @@ class PushplusSender:
         return False
 
     def _send_pushplus_chunked(self, api_url: str, content: str, title: str, max_bytes: int) -> bool:
-        """分批发送长 PushPlus 消息，给 JSON payload 预留空间。"""
+        """Legacy Markdown-chunked path (kept for external callers)."""
+        html_content = self._markdown_to_html(content)
+        template = "html" if html_content != content else "markdown"
+        return self._send_pushplus_chunked_html(api_url, html_content, title, template, max_bytes)
+
+    def _send_pushplus_chunked_html(
+        self, api_url: str, html: str, title: str, template: str, max_bytes: int
+    ) -> bool:
+        """分批发送已转换为 HTML 的 PushPlus 消息。"""
         budget = max(1000, max_bytes - 1500)
-        chunks = chunk_content_by_max_bytes(content, budget, add_page_marker=True)
+        chunks = chunk_content_by_max_bytes(html, budget, add_page_marker=True)
         total_chunks = len(chunks)
         success_count = 0
 
@@ -136,7 +154,7 @@ class PushplusSender:
 
         for i, chunk in enumerate(chunks):
             chunk_title = f"{title} ({i+1}/{total_chunks})" if total_chunks > 1 else title
-            if self._send_pushplus_message(api_url, chunk, chunk_title):
+            if self._send_pushplus_payload(api_url, chunk, chunk_title, template):
                 success_count += 1
                 logger.info(f"PushPlus 第 {i+1}/{total_chunks} 批发送成功")
             else:
