@@ -901,10 +901,10 @@ class DragonTigerChain:
         return report.ai_report
 
     @staticmethod
-    def build_compact_push(report: "DragonTigerReport", top_n: int = 8) -> str:
+    def build_compact_push(report: "DragonTigerReport") -> str:
         """
-        生成适合微信单条推送的精简版报告（约 2-4 KB）。
-        包含：热门板块、重点推荐股、危险回避股、操作提示。
+        生成适合微信单条推送的精简版报告。
+        显示全部主力净流入个股（紧凑格式），危险回避股，操作原则。
         """
         lines = [
             f"## 监链速报 {report.date} {report.scan_time}",
@@ -913,43 +913,41 @@ class DragonTigerChain:
 
         # 热门板块（前3）
         if report.hot_sectors:
-            lines.append("**热门板块**")
+            lines.append("**📊 热门板块**")
             for s in report.hot_sectors[:3]:
                 lines.append(
-                    f"- {s.name}：净流入 {s.net_inflow:.1f}亿 | 涨幅 {s.change_pct:.1f}%"
+                    f"· {s.name} 净流入{s.net_inflow:.1f}亿 涨{s.change_pct:.1f}%"
                 )
             lines.append("")
 
-        # 重点推荐（机构主导，评分靠前）
-        top = [c for c in report.candidates if c.main_net_inflow > 0][:top_n]
-        if top:
-            lines.append(f"**重点关注（共 {len(report.candidates)} 只，取前 {len(top)}）**")
-            for c in top:
-                flag = "🏛机构" if c.institutional_net > 0 else "💰主力"
+        # 全部主力净流入个股（紧凑单行）
+        inflow = [c for c in report.candidates if c.main_net_inflow > 0]
+        if inflow:
+            lines.append(f"**✅ 主力流入（{len(inflow)} 只）**")
+            for c in inflow:
+                flag = "🏛" if c.institutional_net > 0 else "💰"
+                out_flag = "散出" if c.retail_net_inflow < 0 else f"散入{c.retail_net_inflow:+.0f}"
                 lines.append(
-                    f"- **{c.code} {c.name}** {flag} | 评分{c.total_score:.0f}"
-                    f" | 主力{c.main_net_inflow:+.0f}万 | 散户{c.retail_net_inflow:+.0f}万"
+                    f"{flag}{c.code} {c.name} 评{c.total_score:.0f}"
+                    f" 主{c.main_net_inflow:+.0f}万 {out_flag}万"
                 )
             lines.append("")
 
-        # 危险回避
-        danger = [
-            c for c in report.candidates
-            if c.main_net_inflow < 0 and c.retail_net_inflow > 0
-        ]
+        # 危险回避（主力出 + 散户进）
+        danger = [c for c in report.candidates if c.main_net_inflow < 0 and c.retail_net_inflow > 0]
         if danger:
-            lines.append("**⚠️ 危险回避（主力出货 + 散户接盘）**")
-            for c in danger[:5]:
-                lines.append(f"- ❌ {c.code} {c.name}：主力{c.main_net_inflow:+.0f}万 / 散户{c.retail_net_inflow:+.0f}万")
+            lines.append(f"**❌ 危险回避（{len(danger)} 只）**")
+            for c in danger:
+                lines.append(
+                    f"· {c.code} {c.name} 主{c.main_net_inflow:+.0f}万/散{c.retail_net_inflow:+.0f}万"
+                )
             lines.append("")
 
+        total = len(report.candidates)
         lines += [
-            "**操作原则**",
-            "✅ 机构净买 + 主力净流入 → 优先关注",
-            "✅ 主力进 + 散户出 → 最强介入",
-            "❌ 主力出 + 散户进 → 坚决回避",
+            f"共扫描 {total} 只 | 机构主导{report.institutional_dominant}只 | 散户主导{report.retail_dominant}只",
             "",
-            "> 以上仅供参考，不构成投资建议。",
+            "> ⚠️ 仅供参考，不构成投资建议。",
         ]
 
         return "\n".join(lines)
