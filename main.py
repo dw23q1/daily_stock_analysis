@@ -210,6 +210,39 @@ def parse_arguments() -> argparse.Namespace:
         help='强制回测（即使已有回测结果也重新计算）'
     )
 
+    # === 龙虎榜监链 ===
+    parser.add_argument(
+        '--dragon-scan',
+        action='store_true',
+        help='运行A股监链：政策→板块→龙虎榜→资金分类→基本面过滤→报告'
+    )
+
+    parser.add_argument(
+        '--dragon-date',
+        type=str,
+        default=None,
+        help='监链扫描日期 YYYYMMDD（默认今日）'
+    )
+
+    parser.add_argument(
+        '--dragon-max-stocks',
+        type=int,
+        default=30,
+        help='监链最多处理候选股数量（默认30，控制速度）'
+    )
+
+    parser.add_argument(
+        '--dragon-no-auditor',
+        action='store_true',
+        help='跳过审计机构基本面过滤（加速）'
+    )
+
+    parser.add_argument(
+        '--dragon-compact',
+        action='store_true',
+        help='推送精简版报告到微信（只含重点个股和危险回避，单条消息不超限）'
+    )
+
     return parser.parse_args()
 
 
@@ -602,6 +635,70 @@ def main() -> int:
                 f"回测完成: processed={stats.get('processed')} saved={stats.get('saved')} "
                 f"completed={stats.get('completed')} insufficient={stats.get('insufficient')} errors={stats.get('errors')}"
             )
+            return 0
+
+        # 模式1b: 龙虎榜监链
+        if getattr(args, 'dragon_scan', False):
+            logger.info("模式: A股监链（龙虎榜量化监控）")
+            from src.analyzer import GeminiAnalyzer
+            from src.notification import NotificationService
+            from src.search_service import SearchService
+            from src.core.dragon_tiger_chain import run_dragon_tiger_chain
+
+            notifier = NotificationService()
+            search_service = None
+            analyzer = None
+
+            if (config.bocha_api_keys or config.tavily_api_keys or config.brave_api_keys
+                    or config.serpapi_keys or config.minimax_api_keys or config.searxng_base_urls):
+                search_service = SearchService(
+                    bocha_keys=config.bocha_api_keys,
+                    tavily_keys=config.tavily_api_keys,
+                    brave_keys=config.brave_api_keys,
+                    serpapi_keys=config.serpapi_keys,
+                    minimax_keys=config.minimax_api_keys,
+                    searxng_base_urls=config.searxng_base_urls,
+                    news_max_age_days=config.news_max_age_days,
+                )
+
+            if config.gemini_api_key or config.openai_api_key or config.deepseek_api_keys:
+                analyzer = GeminiAnalyzer(api_key=config.gemini_api_key)
+                if not analyzer.is_available():
+                    logger.warning("AI 分析器不可用，将使用模板报告")
+                    analyzer = None
+
+            trade_date = getattr(args, 'dragon_date', None)
+            max_stocks = getattr(args, 'dragon_max_stocks', 30)
+            enable_auditor = not getattr(args, 'dragon_no_auditor', False)
+
+            dragon_report = run_dragon_tiger_chain(
+                search_service=search_service,
+                analyzer=analyzer,
+                trade_date=trade_date,
+                max_stocks=max_stocks,
+                enable_auditor_check=enable_auditor,
+            )
+
+            # 输出报告到控制台
+            print("\n" + "=" * 70)
+            print(dragon_report.ai_report)
+            print("=" * 70)
+
+            # 发送通知（如果配置了且未禁用）
+            if not args.no_notify and dragon_report.ai_report:
+                try:
+                    use_compact = getattr(args, 'dragon_compact', False)
+                    if use_compact:
+                        from src.core.dragon_tiger_chain import DragonTigerChain
+                        push_content = DragonTigerChain.build_compact_push(dragon_report)
+                    else:
+                        title = f"## A股监链报告 {dragon_report.date} {dragon_report.scan_time}\n\n"
+                        push_content = title + dragon_report.ai_report
+                    notifier.send(content=push_content, email_send_to_all=True)
+                    logger.info("[监链] 报告已发送通知（%s）", "精简版" if use_compact else "完整版")
+                except Exception as e:
+                    logger.warning("[监链] 通知发送失败: %s", e)
+
             return 0
 
         # 模式1: 仅大盘复盘
