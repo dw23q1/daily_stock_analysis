@@ -237,6 +237,12 @@ def parse_arguments() -> argparse.Namespace:
         help='跳过审计机构基本面过滤（加速）'
     )
 
+    parser.add_argument(
+        '--dragon-compact',
+        action='store_true',
+        help='推送精简版报告到微信（只含重点个股和危险回避，单条消息不超限）'
+    )
+
     return parser.parse_args()
 
 
@@ -681,12 +687,15 @@ def main() -> int:
             # 发送通知（如果配置了且未禁用）
             if not args.no_notify and dragon_report.ai_report:
                 try:
-                    title = f"## A股监链报告 {dragon_report.date} {dragon_report.scan_time}\n\n"
-                    notifier.send(
-                        content=title + dragon_report.ai_report,
-                        email_send_to_all=True,
-                    )
-                    logger.info("[监链] 报告已发送通知")
+                    use_compact = getattr(args, 'dragon_compact', False)
+                    if use_compact:
+                        from src.core.dragon_tiger_chain import DragonTigerChain
+                        push_content = DragonTigerChain.build_compact_push(dragon_report)
+                    else:
+                        title = f"## A股监链报告 {dragon_report.date} {dragon_report.scan_time}\n\n"
+                        push_content = title + dragon_report.ai_report
+                    notifier.send(content=push_content, email_send_to_all=True)
+                    logger.info("[监链] 报告已发送通知（%s）", "精简版" if use_compact else "完整版")
                 except Exception as e:
                     logger.warning("[监链] 通知发送失败: %s", e)
 

@@ -900,6 +900,60 @@ class DragonTigerChain:
         """将报告格式化为控制台输出文本"""
         return report.ai_report
 
+    @staticmethod
+    def build_compact_push(report: "DragonTigerReport", top_n: int = 8) -> str:
+        """
+        生成适合微信单条推送的精简版报告（约 2-4 KB）。
+        包含：热门板块、重点推荐股、危险回避股、操作提示。
+        """
+        lines = [
+            f"## 监链速报 {report.date} {report.scan_time}",
+            "",
+        ]
+
+        # 热门板块（前3）
+        if report.hot_sectors:
+            lines.append("**热门板块**")
+            for s in report.hot_sectors[:3]:
+                lines.append(
+                    f"- {s.name}：净流入 {s.net_inflow:.1f}亿 | 涨幅 {s.change_pct:.1f}%"
+                )
+            lines.append("")
+
+        # 重点推荐（机构主导，评分靠前）
+        top = [c for c in report.candidates if c.main_net_inflow > 0][:top_n]
+        if top:
+            lines.append(f"**重点关注（共 {len(report.candidates)} 只，取前 {len(top)}）**")
+            for c in top:
+                flag = "🏛机构" if c.institutional_net > 0 else "💰主力"
+                lines.append(
+                    f"- **{c.code} {c.name}** {flag} | 评分{c.total_score:.0f}"
+                    f" | 主力{c.main_net_inflow:+.0f}万 | 散户{c.retail_net_inflow:+.0f}万"
+                )
+            lines.append("")
+
+        # 危险回避
+        danger = [
+            c for c in report.candidates
+            if c.main_net_inflow < 0 and c.retail_net_inflow > 0
+        ]
+        if danger:
+            lines.append("**⚠️ 危险回避（主力出货 + 散户接盘）**")
+            for c in danger[:5]:
+                lines.append(f"- ❌ {c.code} {c.name}：主力{c.main_net_inflow:+.0f}万 / 散户{c.retail_net_inflow:+.0f}万")
+            lines.append("")
+
+        lines += [
+            "**操作原则**",
+            "✅ 机构净买 + 主力净流入 → 优先关注",
+            "✅ 主力进 + 散户出 → 最强介入",
+            "❌ 主力出 + 散户进 → 坚决回避",
+            "",
+            "> 以上仅供参考，不构成投资建议。",
+        ]
+
+        return "\n".join(lines)
+
 
 def run_dragon_tiger_chain(
     search_service=None,
