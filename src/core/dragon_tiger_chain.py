@@ -103,12 +103,17 @@ class DragonTigerReport:
     hot_sectors: List[SectorHeat] = field(default_factory=list)
     candidates: List[StockCandidate] = field(default_factory=list)
 
+    # 危险监控（散户>主力，单独列出供参考/回避）
+    # 这些股票评分被扣至负数，不进入 candidates 主列表，但在报告中专门警示
+    danger_watch: List[StockCandidate] = field(default_factory=list)
+
     # 统计
     total_candidates: int = 0
     institutional_dominant: int = 0     # 机构主导流入的股票数
     retail_dominant: int = 0            # 散户主导流入的股票数
     limit_up_count: int = 0
     lhb_count: int = 0
+    danger_count: int = 0               # 危险信号个股数
 
     ai_report: str = ""
     errors: List[str] = field(default_factory=list)
@@ -134,7 +139,13 @@ class DragonTigerChain:
     SCORE_MAIN_FLOW_INFLOW = 25         # 主力资金净流入
     SCORE_RETAIL_DIVERGENCE = 10        # 主力进/散户出（最强形态）
     SCORE_LIMIT_UP = 10                 # 涨停板加分
-    SCORE_CONSECUTIVE = 10             # 连板加分
+    SCORE_CONSECUTIVE = 10              # 连板加分
+
+    # 危险信号扣分（散户 > 主力）
+    # 逻辑：散户净流入 > 主力净流入 → 资金结构恶化，主力可能在减仓出货
+    PENALTY_RETAIL_GT_MAIN_MILD = -15   # 散户>主力（同向流入，散户略多）
+    PENALTY_RETAIL_GT_MAIN_STRONG = -25 # 散户远超主力（>2倍）
+    PENALTY_MAIN_OUT_RETAIL_IN = -35    # 最危险：主力净流出 + 散户净流入
 
     # 散户主导流出的股票仍可关注（看机构动作）
     MIN_SCORE_THRESHOLD = 20
@@ -193,12 +204,15 @@ class DragonTigerChain:
         if self.enable_auditor_check:
             candidates = self._step5_filter_fundamentals(candidates)
 
-        # Step 6: 评分排序
+        # Step 6: 评分排序（危险股被分离进 _danger_buffer）
+        self._danger_buffer: List[StockCandidate] = []
         candidates = self._step6_score_and_rank(candidates)
 
         # 统计
         report.candidates = candidates
+        report.danger_watch = self._danger_buffer
         report.total_candidates = len(candidates)
+        report.danger_count = len(report.danger_watch)
         report.institutional_dominant = sum(
             1 for c in candidates if "机构主导流入" in c.flow_dominance
         )
@@ -211,8 +225,8 @@ class DragonTigerChain:
         # Step 7: AI 报告
         report.ai_report = self._step7_generate_report(report)
 
-        logger.info("[监链] 扫描完成，候选 %d 只，机构主导 %d 只，散户主导 %d 只",
-                    report.total_candidates, report.institutional_dominant, report.retail_dominant)
+        logger.info("[监链] 扫描完成，候选 %d 只，危险监控 %d 只，机构主导 %d 只",
+                    report.total_candidates, report.danger_count, report.institutional_dominant)
 
         return report
 
@@ -568,6 +582,41 @@ class DragonTigerChain:
                 breakdown["主力进散户出"] = self.SCORE_RETAIL_DIVERGENCE
                 c.alert_tags.append("主力进/散户出（强势形态）")
 
+            # --- 散户净流入 > 主力净流入（危险信号）---
+            # 情形1（最危险）：主力净流出，散户净流入 → 经典出货接盘
+            elif c.main_net_inflow < 0 and c.retail_net_inflow > 0:
+                penalty = self.PENALTY_MAIN_OUT_RETAIL_IN
+                score += penalty
+                breakdown["主力出货散户接盘"] = penalty
+                ratio = c.retail_net_inflow / max(abs(c.main_net_inflow), 1)
+                c.risk_tags.append(
+                    f"⚠️【危险】主力净流出{abs(c.main_net_inflow):.0f}万，"
+                    f"散户接盘{c.retail_net_inflow:.0f}万（散户/主力={ratio:.1f}x）"
+                )
+
+            # 情形2（较危险）：两者均为净流入，但散户 > 主力 2倍以上
+            elif (c.main_net_inflow > 0 and c.retail_net_inflow > 0
+                  and c.retail_net_inflow > c.main_net_inflow * 2):
+                penalty = self.PENALTY_RETAIL_GT_MAIN_STRONG
+                score += penalty
+                breakdown["散户远超主力"] = penalty
+                ratio = c.retail_net_inflow / max(c.main_net_inflow, 1)
+                c.risk_tags.append(
+                    f"⚠️【较危险】散户净流入{c.retail_net_inflow:.0f}万 是主力的{ratio:.1f}倍，"
+                    f"资金结构偏散户化"
+                )
+
+            # 情形3（温和风险）：两者均为净流入，散户略多于主力
+            elif (c.main_net_inflow > 0 and c.retail_net_inflow > 0
+                  and c.retail_net_inflow > c.main_net_inflow):
+                penalty = self.PENALTY_RETAIL_GT_MAIN_MILD
+                score += penalty
+                breakdown["散户略多于主力"] = penalty
+                c.risk_tags.append(
+                    f"注意：散户净流入({c.retail_net_inflow:.0f}万) > "
+                    f"主力净流入({c.main_net_inflow:.0f}万)，追高需谨慎"
+                )
+
             # --- 涨停 ---
             if c.source in ("limit_up", "lhb_and_zt", "consecutive"):
                 score += self.SCORE_LIMIT_UP
@@ -588,12 +637,20 @@ class DragonTigerChain:
             c.total_score = round(score, 1)
             c.score_breakdown = breakdown
 
-        # 过滤低分 + 排序
-        filtered = [c for c in candidates if c.total_score >= self.MIN_SCORE_THRESHOLD]
-        filtered.sort(key=lambda x: x.total_score, reverse=True)
+        # 分类：正常候选 vs 危险监控（散户>主力导致负分）
+        # 危险股单独保存进 danger_watch，不混入主候选列表
+        normal = [c for c in candidates if c.total_score >= self.MIN_SCORE_THRESHOLD]
+        danger = [c for c in candidates if c.total_score < self.MIN_SCORE_THRESHOLD]
 
-        logger.info("[监链 Step6] 评分完成，达标 %d 只", len(filtered))
-        return filtered
+        normal.sort(key=lambda x: x.total_score, reverse=True)
+        # 危险股按危险程度排序（分越低越危险，放最前面）
+        danger.sort(key=lambda x: x.total_score)
+
+        # 把危险股挂在 _danger_buffer 供 run() 取用
+        self._danger_buffer = danger
+
+        logger.info("[监链 Step6] 评分完成：达标 %d 只，危险监控 %d 只", len(normal), len(danger))
+        return normal
 
     # ── Step 7: AI 报告 ───────────────────────────
 
@@ -647,6 +704,17 @@ class DragonTigerChain:
 
         stock_text = "\n".join(stock_rows) or "无达标候选股"
 
+        # 危险监控股（散户>主力）
+        danger_rows = []
+        for c in report.danger_watch[:10]:
+            ratio = (c.retail_net_inflow / max(abs(c.main_net_inflow), 1)) if c.retail_net_inflow > 0 else 0
+            level = "🔴最危险" if c.main_net_inflow < 0 else ("🟠较危险" if ratio >= 2 else "🟡温和风险")
+            danger_rows.append(
+                f"{level} {c.code} {c.name} | 主力{c.main_net_inflow:+.0f}万 / 散户{c.retail_net_inflow:+.0f}万"
+                f"（散户/主力={ratio:.1f}x）| 评分:{c.total_score:.0f}"
+            )
+        danger_text = "\n".join(danger_rows) or "无危险信号个股"
+
         return f"""你是一位专业的A股量化分析师。请根据以下监链数据生成今日操作建议报告。
 
 【扫描时间】{report.date} {report.scan_time}
@@ -657,11 +725,15 @@ class DragonTigerChain:
 【Step2 热门板块 TOP5】
 {sector_text}
 
-【Step3-6 候选个股（按评分排序）】
+【Step3-6 候选个股（按评分排序，已过滤危险股）】
 {stock_text}
+
+【危险监控个股（散户净流入>主力，出货接盘风险）】
+{danger_text}
 
 【统计】
 - 候选总数: {report.total_candidates} 只
+- 危险监控: {report.danger_count} 只（散户>主力，不在主推荐列表）
 - 机构主导流入: {report.institutional_dominant} 只
 - 散户主导流入: {report.retail_dominant} 只
 - 今日上龙虎榜: {report.lhb_count} 只
@@ -682,8 +754,12 @@ class DragonTigerChain:
 ### 三、重点关注个股（机构主导 TOP5）
 （对机构净流入最多的股票逐一分析，包括上榜原因、资金性质、操作建议）
 
-### 四、散户主导个股风险提示
-（指出散户主导流入的个股，提示追高风险）
+### 四、散户 vs 主力资金结构警示
+（重点分析以下危险形态，按严重程度排序：
+  🔴 最危险：主力净流出 + 散户净流入（出货接盘）
+  🟠 较危险：散户净流入是主力2倍以上（散户FOMO）
+  🟡 温和风险：散户净流入略高于主力（追高需慎）
+列出具体股票代码、散户/主力比例、操作建议）
 
 ### 五、今日操作策略
 （结合时间段给出具体操作策略：早盘已过→关注尾盘/隔日，下午盘→可介入点位）
@@ -732,17 +808,67 @@ class DragonTigerChain:
                 f"| {tags}{risks} | {c.auditor_quality} |"
             )
 
+        # 按危险等级分类散户>主力的个股
+        danger_critical = [
+            c for c in report.candidates
+            if c.main_net_inflow < 0 and c.retail_net_inflow > 0
+        ]
+        danger_strong = [
+            c for c in report.candidates
+            if c.main_net_inflow > 0 and c.retail_net_inflow > c.main_net_inflow * 2
+        ]
+        danger_mild = [
+            c for c in report.candidates
+            if c.main_net_inflow > 0 < c.retail_net_inflow
+            and c.main_net_inflow < c.retail_net_inflow <= c.main_net_inflow * 2
+        ]
+
         lines += [
             "",
-            "### 四、机构 vs 散户资金对比",
+            "### 四、散户 vs 主力资金结构警示",
+        ]
+
+        if danger_critical:
+            lines.append("#### 🔴 最危险：主力净流出 + 散户净流入（出货接盘形态）")
+            for c in danger_critical:
+                ratio = c.retail_net_inflow / max(abs(c.main_net_inflow), 1)
+                lines.append(
+                    f"- **{c.code} {c.name}**：主力流出 {abs(c.main_net_inflow):.0f}万，"
+                    f"散户接盘 {c.retail_net_inflow:.0f}万（{ratio:.1f}x）→ 建议回避"
+                )
+        if danger_strong:
+            lines.append("#### 🟠 较危险：散户净流入是主力2倍以上")
+            for c in danger_strong:
+                ratio = c.retail_net_inflow / max(c.main_net_inflow, 1)
+                lines.append(
+                    f"- **{c.code} {c.name}**：散户{c.retail_net_inflow:.0f}万 vs 主力{c.main_net_inflow:.0f}万"
+                    f"（{ratio:.1f}x）→ 谨慎，散户FOMO情绪主导"
+                )
+        if danger_mild:
+            lines.append("#### 🟡 温和风险：散户略高于主力")
+            for c in danger_mild:
+                lines.append(
+                    f"- **{c.code} {c.name}**：散户{c.retail_net_inflow:.0f}万 > 主力{c.main_net_inflow:.0f}万"
+                    f" → 关注但不追高"
+                )
+        if not (danger_critical or danger_strong or danger_mild):
+            lines.append("- 本次候选股中暂无明显散户主导风险（资金结构健康）")
+
+        lines += [
+            "",
+            "### 五、机构 vs 散户汇总",
             f"- 机构主导流入个股：**{report.institutional_dominant}** 只",
             f"- 散户主导流入个股：**{report.retail_dominant}** 只",
             f"- 今日上龙虎榜：**{report.lhb_count}** 只（机构席位净买为强信号）",
+            f"- 🔴主力出货散户接盘：**{len(danger_critical)}** 只",
+            f"- 🟠散户远超主力：**{len(danger_strong)}** 只",
             "",
-            "### 五、操作建议",
+            "### 六、操作建议",
             f"> 扫描时间 {report.scan_time}，注意区分盘中/收盘数据。",
-            "> 机构净买 + 主力净流入 同时满足的个股，优先关注。",
-            "> 散户主导流入 + 连板高位 的个股，追高需谨慎。",
+            "> ✅ 机构净买 + 主力净流入 同时满足的个股，优先关注。",
+            "> ✅ 主力净流入 + 散户净流出（主力进散户出），最强介入形态。",
+            "> ❌ 主力净流出 + 散户净流入，坚决回避，出货接盘典型信号。",
+            "> ⚠️ 散户净流入是主力2倍以上，高位谨慎，追高风险大。",
             "",
             "> ⚠️ 以上数据仅供参考，不构成投资建议。市场有风险，投资需谨慎。",
         ]
