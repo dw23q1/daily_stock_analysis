@@ -174,6 +174,27 @@ class DragonTigerChain:
 
     # ── 公开入口 ──────────────────────────────────
 
+    @staticmethod
+    def _sf(v: Any, default: float = 0.0) -> float:
+        """从 DataFrame row 安全提取 float，兼容 Series/NaN/None。"""
+        if isinstance(v, pd.Series):
+            v = v.iloc[0] if not v.empty else default
+        try:
+            f = float(v)
+            return default if f != f else f  # f != f 捕获 NaN
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _ss(v: Any, default: str = "") -> str:
+        """从 DataFrame row 安全提取 str，兼容 Series。"""
+        if isinstance(v, pd.Series):
+            v = v.iloc[0] if not v.empty else default
+        if v is None:
+            return default
+        s = str(v).strip()
+        return default if s in ("nan", "None", "NaN") else s
+
     def run(self) -> DragonTigerReport:
         """
         执行完整监链，返回报告对象。
@@ -402,16 +423,16 @@ class DragonTigerChain:
         # 3a. 龙虎榜
         lhb_df = self.lhb_fetcher.get_daily_lhb_list(trade_date=date_str, lookback_days=1)
         for _, row in lhb_df.iterrows():
-            code = str(row.get("code", "")).strip().zfill(6)
-            name = str(row.get("name", "")).strip()
+            code = self._ss(row.get("code", "")).zfill(6)
+            name = self._ss(row.get("name", ""))
             if not code or code == "000000":
                 continue
 
             c = StockCandidate(
                 code=code, name=name, source="lhb",
-                change_pct=float(row.get("change_pct", 0) or 0),
+                change_pct=self._sf(row.get("change_pct", 0)),
                 on_lhb=True,
-                lhb_net_buy=float(row.get("lhb_net_buy", 0) or 0) / 1e4,
+                lhb_net_buy=self._sf(row.get("lhb_net_buy", 0)) / 1e4,
             )
             candidates[code] = c
 
@@ -420,8 +441,8 @@ class DragonTigerChain:
         # 3b. 涨停板个股池
         zt_df = self.lhb_fetcher.get_limit_up_pool(trade_date=date_str)
         for _, row in zt_df.iterrows():
-            code = str(row.get("code", "")).strip().zfill(6)
-            name = str(row.get("name", "")).strip()
+            code = self._ss(row.get("code", "")).zfill(6)
+            name = self._ss(row.get("name", ""))
             if not code:
                 continue
             if code in candidates:
@@ -429,27 +450,27 @@ class DragonTigerChain:
             else:
                 c = StockCandidate(
                     code=code, name=name, source="limit_up",
-                    change_pct=float(row.get("change_pct", 0) or 0),
-                    sector=str(row.get("sector", "")),
+                    change_pct=self._sf(row.get("change_pct", 0)),
+                    sector=self._ss(row.get("sector", "")),
                 )
                 candidates[code] = c
 
         # 3c. 连板池
         consec_df = self.lhb_fetcher.get_consecutive_limit_up_pool(trade_date=date_str)
         for _, row in consec_df.iterrows():
-            code = str(row.get("code", "")).strip().zfill(6)
-            name = str(row.get("name", "")).strip()
+            code = self._ss(row.get("code", "")).zfill(6)
+            name = self._ss(row.get("name", ""))
             if not code:
                 continue
-            days = int(row.get("consecutive_days", 2) or 2)
+            days = int(self._sf(row.get("consecutive_days", 2), 2.0))
             if code in candidates:
                 candidates[code].consecutive_days = days
                 candidates[code].source = "consecutive"
             else:
                 c = StockCandidate(
                     code=code, name=name, source="consecutive",
-                    change_pct=float(row.get("change_pct", 0) or 0),
-                    sector=str(row.get("sector", "")),
+                    change_pct=self._sf(row.get("change_pct", 0)),
+                    sector=self._ss(row.get("sector", "")),
                     consecutive_days=days,
                 )
                 candidates[code] = c
@@ -457,14 +478,14 @@ class DragonTigerChain:
         # 3d. 强势股池（补充）
         strong_df = self.lhb_fetcher.get_strong_stocks_pool(trade_date=date_str)
         for _, row in strong_df.iterrows():
-            code = str(row.get("code", "")).strip().zfill(6)
+            code = self._ss(row.get("code", "")).zfill(6)
             if code in candidates:
                 continue
-            name = str(row.get("name", "")).strip()
+            name = self._ss(row.get("name", ""))
             c = StockCandidate(
                 code=code, name=name, source="strong",
-                change_pct=float(row.get("change_pct", 0) or 0),
-                sector=str(row.get("sector", "")),
+                change_pct=self._sf(row.get("change_pct", 0)),
+                sector=self._ss(row.get("sector", "")),
             )
             candidates[code] = c
 
